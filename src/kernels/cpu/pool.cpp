@@ -1209,7 +1209,13 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const NodeSync& ns = nsync_[(size_t) s];
                 R = ns.rows; T = ns.tasks; h = ns.h; row0 = ns.row0; j = ci - ns.base;
             }
-            const int64_t g0 = R * j / T, g1 = R * (j + 1) / T;
+            int64_t g0 = R * j / T, g1 = R * (j + 1) / T;
+            // qns rows go in blocks of 8 (qns.hpp: split ranges at multiples of 8). A qns layer's per
+            // (n_ff 640, n_embd 2560), its slice's row0 (per*k/numa_n_) and h are all multiples of 8,
+            // so masking the task's range keeps every r0/r1 aligned; consecutive tasks share the
+            // boundary R*(j+1)/T, so no row is dropped, and the last task's g1 = R is already a
+            // multiple of 8.
+            if (nfmt_->gu_type == kQnsType) { g0 &= ~7ll; g1 &= ~7ll; }
             for (int64_t g = g0; g < g1;) {
                 const int e = (int) (g / h), l0 = (int) (g % h);
                 const int l1 = (int) std::min<int64_t>(h, l0 + (g1 - g));
