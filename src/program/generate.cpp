@@ -16,6 +16,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/platform/memory.hpp"
+#include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/nv_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -49,6 +50,7 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/qns_cuda.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -148,9 +150,36 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <stdexcept>
 #include <string>
 #include <set>
+#include <tuple>
 #include <vector>
 
 namespace {
+
+// The adaptive tier's swaps in one layer of a qns pack.  Every VRAM slot holds the blob it was sized for (qns blobs
+// differ per expert), so each incoming expert (`cand`, most used first) takes the least-used resident expert
+// (`vict`) whose slot holds it, while the gain is at least `min_gain`.  `res`: the layer's row of the residency table.
+// Returns (gain, incoming, outgoing).
+std::vector<std::tuple<float, int32_t, int32_t>> qns_swaps(int64_t layer, const std::vector<std::pair<float, int32_t>>& cand,
+                                                           std::vector<std::pair<float, int32_t>> vict, float min_gain,
+                                                           const int32_t* res, const strata::core::ExpertCache& cache) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::sort(vict.begin(), vict.end(), [](auto& a, auto& b) { return a.first < b.first; });
+    std::vector<char> taken(vict.size(), 0);
+    std::vector<std::tuple<float, int32_t, int32_t>> out;
+    size_t first_free = 0;
+    for (const auto& [usage, in] : cand) {
+        while (first_free < vict.size() && taken[first_free]) ++first_free;
+        if (first_free == vict.size() || usage < vict[first_free].first + min_gain) break;   // no victim gains enough
+        const uint64_t need = lay.expert_bytes(layer, in);
+        for (size_t j = first_free; j < vict.size() && usage >= vict[j].first + min_gain; ++j) {
+            if (taken[j] || cache.slot_bytes(res[vict[j].second]) < need) continue;
+            taken[j] = 1;
+            out.emplace_back(usage - vict[j].first, in, vict[j].second);
+            break;
+        }
+    }
+    return out;
+}
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
 // a Linux driver has no such limit (#253: the 8 GiB cap cost a 4090 + 3060 split 3x of its prompt speed).
@@ -467,6 +496,7 @@ struct Options {
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
+    std::string qns_dense_gguf;               // a qns backbone GGUF: those matrices served as trellis (NativeDense)
     /// Every shard of --native's model (strata::gguf_split_paths: the metadata shard first; a missing shard is an
     /// error) and of --native-head-gguf's (the same list unless that names another model).
     std::vector<std::string> native_shards, native_head_shards;
@@ -700,13 +730,15 @@ struct Options {
     /// windows on a helper thread instead of one window waiting for a whole round (see the tier in the --serve block).
     /// Not bit-exact run to run.  0 = the blocking tier.
     int adapt_async = 0;
+    int adapt_async_given = -1;      ///< --adapt-async on the command line (-1: not given; then the engine may decide, adapt_async_default.hpp)
+    bool adapt_async_self = false;   ///< the engine measures and chooses the asynchronous tier during the session (adapt_async_default.hpp)
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
-    bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
+    bool spec_split = false;   ///< opt-in split verify window (the overlap study: ~7% slower; not bit-exact against no-split, the batch shape of its windows differs)
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
@@ -861,6 +893,7 @@ void usage() {
                  "  --embd-gguf PATH     the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:\n"
                  "                       BF16 as the checkpoint ships it; mapped host memory, no VRAM)\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
+                 "  --qns-dense-gguf PATH  a qns model's backbone as trellis (the GDN/QSA projections it holds; less VRAM)\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
@@ -1071,10 +1104,12 @@ void usage() {
                  "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
                  "  --adapt-min-gain F   the adaptive tier swaps an expert in only when its decayed routing count beats\n"
                  "                       the one it replaces by more than F (default 1.5; higher = fewer, surer swaps)\n"
-                 "  --adapt-async 1      --serve with the resident RAM mode or the arena (one GPU; opt-in): the adaptive\n"
+                 "  --adapt-async 0|1    --serve with the resident RAM mode or the arena (one GPU): the adaptive\n"
                  "                       tier's swaps advance between verify windows instead of a window waiting for a\n"
-                 "                       whole round (the arena: copy-in only).  Not bit-exact run to run.  0 (default)\n"
-                 "                       = the blocking tier.\n");
+                 "                       whole round (the arena: copy-in only).  Not bit-exact run to run.  Without the flag,\n"
+                 "                       the expert arena on one CUDA GPU (no --batch) starts blocking and tries it for a\n"
+                 "                       while when the swaps hold the windows up, keeping it only if it is faster; 0 = the\n"
+                 "                       blocking tier always (also STRATA_ADAPT_ASYNC=0); 1 = always on.\n");
 }
 
 // --lookup-chain: the context's last tokens for the draft sources (at most 64), the MTP's pending drafts last
@@ -2501,6 +2536,7 @@ int main(int argc, char** argv) {
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
+        else if (a == "--qns-dense-gguf") o.qns_dense_gguf = next("--qns-dense-gguf");
         else if (a == "--no-capture") o.no_capture = true;
         else if (a == "--no-pool") o.no_pool = true;
         else if (a == "--sync-every-layer") o.sync_every_layer = true;
@@ -2626,7 +2662,7 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
-        else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
+        else if (a == "--adapt-async") { o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0; o.adapt_async_given = o.adapt_async; }
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -3468,7 +3504,14 @@ int main(int argc, char** argv) {
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
         const auto& lay = strata::kernels::cpu::expert_layout();
-        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
+        if (lay.qns()) {   // Qwen Next S trellis experts: the GPU kernels take the rotations once
+            const float* r = lay.qns_rotation.data();
+            strata::kernels::qns_cuda_set_rotation(r, r + 2560, r + 2585, r + 3225);
+            std::fprintf(stderr, "strata generate: qns pack: trellis experts, compact arena %.2f GiB, each VRAM slot "
+                                 "sized to its expert's blob (up to %.2f MB)\n",
+                         (double) lay.total / 1073741824.0, (double) lay.max_blob / 1e6);
+        }
+        for (int64_t l = 0; lay.native && !lay.qns() && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
@@ -3911,6 +3954,7 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
+        strata::core::NativeDense::set_qns_dense(o.qns_dense_gguf);
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
@@ -4305,6 +4349,11 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<GpuStage>> stages;
     // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
     auto load_stage_weights = [&](GpuStage& st, int64_t lb, int64_t le, bool trim) -> bool {
+        if (strata::kernels::cpu::expert_layout().qns()) {   // the expert rotations live in __constant__ memory, one copy per card
+            const strata::core::OnDevice on(st.dev);
+            const float* r = strata::kernels::cpu::expert_layout().qns_rotation.data();
+            strata::kernels::qns_cuda_set_rotation(r, r + 2560, r + 2585, r + 3225);
+        }
         std::set<std::string> skip_s = skip_base;
         uint64_t pool_s = pool_bytes;
         if (trim) {
@@ -6264,11 +6313,11 @@ int main(int argc, char** argv) {
         const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
-        for (const auto& pr : profile) {
-            const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first), slot_guard);
+        for (const auto& pr : profile) {   // qns: each slot holds its pair's own blob (they differ per expert)
+            const uint64_t b = (uint64_t) strata::core::ExpertCache::slot_stride((int64_t) lay.expert_bytes(pr.first, pr.second), slot_guard);
             if (used + b > cap) break;
             used += b;
-            sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+            sized_slots.push_back((int64_t) lay.expert_bytes(pr.first, pr.second));
         }
         // #831: the sized-slots loop walks the profile's pairs, so the profile's length is the ceiling; an explicit
         // --expert-cache above it used to be cut with no word.  A warning only (what is allocated does not change).
@@ -6477,12 +6526,12 @@ int main(int argc, char** argv) {
             }
             const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(profile[(size_t) i].first, profile[(size_t) i].second))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            fill_bytes += strata::kernels::cpu::expert_layout().expert_bytes(profile[(size_t) i].first, profile[(size_t) i].second);
             ++prefilled;
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
@@ -6491,7 +6540,7 @@ int main(int argc, char** argv) {
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
                                 srcp->blob_stable(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+                                (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(profile[0].first, profile[0].second))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -8031,10 +8080,10 @@ int main(int argc, char** argv) {
             for (; pi < profile.size(); ++pi) {
                 const int32_t l = profile[pi].first, e = profile[pi].second;
                 const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
-                if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                if (host_res[i] >= 0 || lay.expert_bytes(l, e) > room) continue;
                 const uint8_t* b = srcp->blob_stable(l, e);
                 if (b == nullptr) continue;
-                cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice,
+                cudaMemcpyAsync(xcache.device_slot((int32_t) s), b, (size_t) lay.expert_bytes(l, e), cudaMemcpyHostToDevice,
                                 nullptr);
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
@@ -8074,6 +8123,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --adapt-async 1 is off (%s): the blocking adaptive tier\n", why);
         o.adapt_async = 0;
     };
+    // Where the asynchronous tier could run on its own (CUDA, one GPU, the expert arena, no batch slots), the engine measures
+    // and chooses during the session: see include/strata/core/adapt_async_default.hpp.  --adapt-async 0 or
+    // STRATA_ADAPT_ASYNC=0 keep the blocking tier; --adapt-async 1 keeps its old meaning.
+    if (o.adapt_async_given < 0) {
+        strata::core::AdaptAsyncAuto aa;
+        aa.flag = o.adapt_async_given;
+        aa.env = strata::core::adapt_async_env();
+#if !defined(STRATA_USE_HIP)
+        aa.cuda = true;
+#endif
+        aa.serve = o.serve;
+        aa.adaptive = o.adapt_every > 0 && o.adapt_swaps > 0;
+        aa.arena = srcp == &arena_src;
+        aa.multi_gpu = multi_gpu;
+        aa.pipeline_windows = o.pipeline_windows >= 2;
+        aa.batch = o.batch > 0;
+        aa.peer = peer.valid();
+        aa.remote_opt = remote_opt != nullptr;
+        aa.adapt_overlap = adapt_overlap();
+        o.adapt_async_self = strata::core::adapt_async_self_decides(aa);
+    }
     if (o.adapt_async) {
         static const bool pl_async = [] {
             const char* v = std::getenv("STRATA_PIPELINE_ADAPT_ASYNC");
@@ -10035,6 +10105,8 @@ int main(int argc, char** argv) {
             pcie_auto.on = true;
             pcie_auto.link_gbps = o.pcie_probe_gbps;
             pcie_auto.blob_bytes = g.n_layers > 0 ? sum / (double) g.n_layers : 0.0;
+            if (pl.qns())   // a PCIe fetch moves a qns blob's own bytes (fetch_qns_blobs): the mean blob, not the layer's largest
+                pcie_auto.blob_bytes = (double) pl.blob_offset(g.n_layers - 1, pl.n_expert) / (double) (g.n_layers * pl.n_expert);
         }
         // PcieAuto after a decode window (the serial loop, and 0.1.44 the pipelined one at every verdict): the share, refined from
         // the CPU pool's speed.  A layer split: every later stage takes the share its own probed link gives against the same pool
@@ -10319,6 +10391,11 @@ int main(int argc, char** argv) {
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
+                if (strata::kernels::cpu::expert_layout().qns()) {
+                    for (const auto& [gain, in, out] : qns_swaps(l, cand, vict, o.adapt_min_gain, r, xcache))
+                        swaps.push_back({gain, (int32_t) l, in, out});
+                    continue;
+                }
                 for (size_t i = 0; i < nc; ++i) {
                     if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
@@ -10390,7 +10467,7 @@ int main(int argc, char** argv) {
                 if (dma_mode != 0 && slot >= 0 && b != nullptr) {
                     cp_dst.push_back(xcache.device_slot(slot));
                     cp_src.push_back(b);
-                    cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                    cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in));
                     main_live = true;
                     host_res[out] = strata::core::kNotResident;
                     srcp->prefetch(s.layer, s.out);
@@ -10399,7 +10476,7 @@ int main(int argc, char** argv) {
                 }
                 if (slot < 0 || b == nullptr ||
                     adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                   (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                   (size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in),
                                    gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
@@ -10541,15 +10618,25 @@ int main(int argc, char** argv) {
         const bool a_inline = a_arena && a_env("STRATA_ADAPT_PICK_INLINE", 1) != 0;
         const bool a_wait = a_arena && a_env("STRATA_ADAPT_ASYNC_WAIT", 1) != 0;
         const size_t a_batch = a_arena ? (size_t) std::max(0, a_env("STRATA_ADAPT_ASYNC_BATCH", 0)) : 0;
-        if (o.adapt_async && !drive.d.usage.empty() &&
+        // o.adapt_async_self (arena, one GPU, nothing explicit): the homes are set up, the job thread is created only when the
+        // session's measurement turns the asynchronous tier on (asw_*, in the decode loop)
+        const bool a_self = o.adapt_async_self && !o.adapt_async && a_arena && !drive.d.usage.empty();
+        if ((o.adapt_async || a_self) && !drive.d.usage.empty() &&
             ((src.complement_ready() && src.exchange_capacity() >= 2 * a_cap) || a_arena)) {
             ahomes.push_back({&xcache, adapt_stream, adapt_ev, 0, false});
             for (auto& st : stages) ahomes.push_back({&st->cache, st->adapt_stream, st->adapt_ev, st->dev, false});
-            ajob = std::make_unique<JobThread>();
-            std::fprintf(stderr, "strata serve: adaptive tier asynchronous (--adapt-async 1): up to %lld swaps per round, "
-                                 "a round every %d windows%s\n", (long long) a_cap, o.adapt_every,
-                         a_arena ? " (arena: copy-in only)" : "");
+            if (o.adapt_async) {
+                ajob = std::make_unique<JobThread>();
+                std::fprintf(stderr, "strata serve: adaptive tier asynchronous (--adapt-async 1): up to %lld swaps per round, "
+                                     "a round every %d windows%s\n", (long long) a_cap, o.adapt_every,
+                             a_arena ? " (arena: copy-in only)" : "");
+            } else {
+                std::fprintf(stderr, "strata serve: adaptive tier: blocking, and the asynchronous tier is tried once the session "
+                                     "shows the swaps hold the windows up (--adapt-async 0 or STRATA_ADAPT_ASYNC=0: never)\n");
+            }
         }
+        strata::core::AdaptAsyncSelf asw;   // the session's choice between the two tiers (adapt_async_default.hpp)
+        if (a_self && !ahomes.empty()) asw.arm();
         // the pipelined loop's side (see above): whether stage `st` has no window in flight; per home, the copies back
         // and in to queue at its next gap, the RAM fence still to pass and the gaps seen
         std::function<bool(int)> a_pl_idle;
@@ -10583,6 +10670,11 @@ int main(int argc, char** argv) {
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
+                if (strata::kernels::cpu::expert_layout().qns()) {
+                    for (const auto& [gain, in, out] : qns_swaps(l, cand, vict, o.adapt_min_gain, r, xcache))
+                        all.push_back({gain, (int32_t) l, in, out});
+                    continue;
+                }
                 for (size_t i = 0; i < nc; ++i) {
                     if (cand[i].first < vict[i].first + o.adapt_min_gain) break;
                     all.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
@@ -11280,7 +11372,7 @@ int main(int argc, char** argv) {
                         float best = -1.0f;
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t j = (size_t) (layer * g.n_expert + ex);
-                            if (host_res[j] >= 0) continue;
+                            if (host_res[j] >= 0 || strata::kernels::cpu::expert_layout().expert_bytes(layer, ex) > xcache.slot_bytes(slot)) continue;
                             const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
                             if (u > best) { best = u; pick = (int64_t) j; }
                         }
@@ -11288,7 +11380,7 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                            (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(layer, pick % g.n_expert))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
                     }
@@ -13274,7 +13366,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(i / g.n_expert, i % g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
@@ -14934,6 +15026,8 @@ int main(int argc, char** argv) {
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
                 const Clock::time_point taw0 = Clock::now();
+                const bool asw_skip = first_window || merged;   // the session's tier choice counts steady decode windows only
+                double asw_wait_ms = 0;
                 if (adapt_nowait()) apply_pending(false);
                 else if (aov && !pending.empty() && !aflipped) {
                     // 0.1.43 STRATA_ADAPT_OVERLAP: the tables take the swaps now, exactly where the wait would have ended;
@@ -15062,7 +15156,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
                 }
-                dt_adapt_wait += std::chrono::duration<double, std::milli>(Clock::now() - taw0).count();
+                asw_wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - taw0).count();
+                dt_adapt_wait += asw_wait_ms;
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -15177,11 +15272,35 @@ int main(int argc, char** argv) {
                 if (adapt_thr.joinable()) {
                     const Clock::time_point taj0 = Clock::now();
                     adapt_thr.join();
-                    dt_adapt_join += std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
+                    const double asw_join = std::chrono::duration<double, std::milli>(Clock::now() - taj0).count();
+                    dt_adapt_join += asw_join;
+                    asw_wait_ms += asw_join;
                 }
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
+                }
+                // the session's choice of the adaptive tier (adapt_async_default.hpp): ~64 windows on the blocking tier, then
+                // ~64 on the asynchronous one if the swaps held the windows up, kept only if the decode got faster
+                if (!asw_skip && (asw.phase() == strata::core::AdaptAsyncSelf::Phase::Measure || asw.trialing())) {
+                    const bool was_trial = asw.trialing();
+                    const double asw_ms = std::chrono::duration<double, std::milli>(Clock::now() - taw0).count();
+                    const auto act = asw.window(asw_ms, asw_wait_ms, a + 1);
+                    if (act == strata::core::AdaptAsyncSelf::Action::ToAsync) {
+                        ajob = std::make_unique<JobThread>();
+                        std::fprintf(stderr, "strata serve: adaptive tier: the swaps held the windows up by %.1f%% (%.2f ms per "
+                                             "token): trying the asynchronous tier for a while\n",
+                                     100.0 * asw.wait_fraction(), asw.measure_ms_per_token());
+                    } else if (act == strata::core::AdaptAsyncSelf::Action::ToBlocking) {
+                        adapt_quiesce();
+                        ajob.reset();
+                        std::fprintf(stderr, "strata serve: adaptive tier: the asynchronous tier was slower (%.2f against "
+                                             "%.2f ms per token): back to the blocking tier for this session\n",
+                                     asw.trial_ms_per_token(), asw.measure_ms_per_token());
+                    } else if (was_trial && asw.kept()) {
+                        std::fprintf(stderr, "strata serve: adaptive tier: the asynchronous tier stays on (%.2f against %.2f ms "
+                                             "per token)\n", asw.trial_ms_per_token(), asw.measure_ms_per_token());
+                    }
                 }
                 if (!drafted) {
                     std::printf("ERR %s\n", err.c_str());
@@ -15822,7 +15941,7 @@ int main(int argc, char** argv) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().expert_bytes(i / g.n_expert, i % g.n_expert);
                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
                                                         : xcache.fill_slot_queued(slot, b, err, nb))) {
                     std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
@@ -16312,6 +16431,11 @@ int main(int argc, char** argv) {
                 const size_t nc = std::min(cand.size(), vict.size());
                 std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                                   [](auto& a, auto& b) { return a.first < b.first; });
+                if (strata::kernels::cpu::expert_layout().qns()) {
+                    for (const auto& [gain, in, out] : qns_swaps(l, cand, vict, 1.5f, r, xcache))
+                        swaps.push_back({gain, (int32_t) l, in, out});
+                    continue;
+                }
                 for (size_t i = 0; i < nc; ++i) {
                     if (cand[i].first < vict[i].first + 1.5f) break;
                     swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
@@ -16342,7 +16466,7 @@ int main(int argc, char** argv) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob_stable(s.layer, s.in);
-                const size_t blob_n = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                const size_t blob_n = (size_t) strata::kernels::cpu::expert_layout().expert_bytes(s.layer, s.in);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
